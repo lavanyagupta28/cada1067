@@ -196,10 +196,55 @@ class EDAEngine:
         self._last_constant_input_report: Optional[dict] = None
         self._last_constant_input_matches: Optional[List[dict]] = None
         self._last_constant_input_signature: Optional[tuple] = None
+        # Combinational adjacency and graph index cache
+        self._comb_forward_adj: Optional[Dict[str, List[str]]] = None
+        self._comb_backward_adj: Optional[Dict[str, List[str]]] = None
+        self._cached_netlist_id: Optional[int] = None
+        self._cached_node_count: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Netlist lifecycle
     # ------------------------------------------------------------------
+
+    def _invalidate_comb_caches(self) -> None:
+        """Clear cached combinational graph structures."""
+        self._comb_forward_adj = None
+        self._comb_backward_adj = None
+        self._cached_netlist_id = None
+        self._cached_node_count = None
+
+    def _ensure_comb_adj(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Lazily construct and cache forward and backward combinational adjacency.
+
+        DFF boundaries (Q-to-D) are treated as cuts.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        if (
+            self._comb_forward_adj is not None
+            and self._comb_backward_adj is not None
+            and self._cached_netlist_id == id(nl)
+            and self._cached_node_count == len(nl.nodes)
+        ):
+            return self._comb_forward_adj, self._comb_backward_adj
+
+        fwd: Dict[str, List[str]] = {}
+        bwd: Dict[str, List[str]] = {}
+
+        for node in nl.nodes.values():
+            out_sig = node.output
+            inputs = node.inputs
+            bwd[out_sig] = list(inputs)
+            for inp in inputs:
+                fwd.setdefault(inp, []).append(out_sig)
+
+        self._comb_forward_adj = fwd
+        self._comb_backward_adj = bwd
+        self._cached_netlist_id = id(nl)
+        self._cached_node_count = len(nl.nodes)
+        return fwd, bwd
 
     def load(self, filepath: str) -> Netlist:
         """Load a Verilog file into the engine and return the Netlist."""
@@ -209,6 +254,7 @@ class EDAEngine:
         self._last_constant_input_report = None
         self._last_constant_input_matches = None
         self._last_constant_input_signature = None
+        self._invalidate_comb_caches()
         return self._netlist
 
     def save(self, filepath: Optional[str] = None) -> None:
@@ -228,6 +274,7 @@ class EDAEngine:
         if label not in self._snapshots:
             raise ValueError(f"No snapshot with label {label!r}")
         self._netlist = copy.deepcopy(self._snapshots[label])
+        self._invalidate_comb_caches()
 
     @property
     def netlist(self) -> Netlist:
@@ -319,26 +366,16 @@ class EDAEngine:
 
         DFF q-to-d arcs are treated as a *cut* (do not follow through DFF).
         """
-        nl = self._netlist
-        assert nl is not None
-        result: List[str] = []
-        for node in nl.nodes.values():
-            if signal in node.inputs:
-                result.append(node.output)
-        
-        return result
+        fwd, _ = self._ensure_comb_adj()
+        return list(fwd.get(signal, []))
 
     def _backward_predecessors(self, signal: str) -> List[str]:
-        """Return all input signals of the gate whose output is *signal*."""
-        nl = self._netlist
-        assert nl is not None
-        out2gate = self._build_output_to_gate()
-        driver = out2gate.get(signal)
-        if driver is None:
-            return []
-        if driver in nl.nodes:
-            return list(nl.nodes[driver].inputs)
-        return []  # DFF — treat as cut
+        """Return all input signals of the gate whose output is *signal*.
+
+        DFF q-to-d arcs are treated as a *cut* (do not follow through DFF).
+        """
+        _, bwd = self._ensure_comb_adj()
+        return list(bwd.get(signal, []))
 
     def _expand_declared_signal(self, name: str) -> List[str]:
         """Return bit names for a declared bus, otherwise the signal itself."""
@@ -563,66 +600,68 @@ class EDAEngine:
         self._resolve_signal(source)
         self._resolve_signal(sink)
 
-        # Topological longest-path via DFS with memoisation
-        # Nodes are signal names; edges follow _forward_successors.
+        if source == sink:
+            return (0, [source])
 
-        # First collect all reachable signals from source (forward BFS)
-        reachable: Set[str] = set()
-        queue: deque[str] = deque([source])
-        while queue:
-            cur = queue.popleft()
-            if cur in reachable:
-                continue
-            reachable.add(cur)
-            for nxt in self._forward_successors(cur):
-                if nxt not in reachable:
-                    queue.append(nxt)
+        fwd, bwd = self._ensure_comb_adj()
 
-        if sink not in reachable:
+        # Step 1: Backward reachability from sink (prunes entire graph to relevant backward cone)
+        backward_reachable: Set[str] = {sink}
+        queue_bwd: deque[str] = deque([sink])
+        while queue_bwd:
+            curr = queue_bwd.popleft()
+            for pred in bwd.get(curr, ()):
+                if pred not in backward_reachable:
+                    backward_reachable.add(pred)
+                    queue_bwd.append(pred)
+
+        # Early exit if source cannot reach sink
+        if source not in backward_reachable:
             return (-1, [])
 
-        # DFS with explicit stack for longest path tracking
-        # dist[s] = longest path length (in gate hops) from source to s
+        # Step 2: Forward reachability from source restricted strictly to backward_reachable
+        # Defines the exact bidirectional induced subgraph: Forward(source) ∩ Backward(sink)
+        relevant_nodes: Set[str] = {source}
+        queue_fwd: deque[str] = deque([source])
+        while queue_fwd:
+            curr = queue_fwd.popleft()
+            for nxt in fwd.get(curr, ()):
+                if nxt in backward_reachable and nxt not in relevant_nodes:
+                    relevant_nodes.add(nxt)
+                    queue_fwd.append(nxt)
+
+        # Step 3: Longest path DP using Kahn's topological sort on the pruned cone
+        in_degree: Dict[str, int] = {node: 0 for node in relevant_nodes}
+        for u in relevant_nodes:
+            for v in fwd.get(u, ()):
+                if v in relevant_nodes:
+                    in_degree[v] += 1
+
         dist: Dict[str, int] = {source: 0}
         parent: Dict[str, Optional[str]] = {source: None}
+        queue: deque[str] = deque([source])
 
-        # Topological sort within reachable
-        visited: Set[str] = set()
-        topo_order: List[str] = []
-
-        def dfs_topo(node: str) -> None:
-            visited.add(node)
-            for nxt in self._forward_successors(node):
-                if nxt in reachable and nxt not in visited:
-                    dfs_topo(nxt)
-            topo_order.append(node)
-
-        dfs_topo(source)
-        topo_order.reverse()
-        # print(f"Topo Order is: ")
-        # print(topo_order)
-
-        for sig in topo_order:
-            for nxt in self._forward_successors(sig):
-                if nxt not in reachable:
-                    continue
-                new_dist = dist.get(sig, -1) + 1
-                if new_dist > dist.get(nxt, -1):
-                    dist[nxt] = new_dist
-                    parent[nxt] = sig
+        while queue:
+            u = queue.popleft()
+            u_dist = dist[u]
+            for v in fwd.get(u, ()):
+                if v in relevant_nodes:
+                    if u_dist + 1 > dist.get(v, -1):
+                        dist[v] = u_dist + 1
+                        parent[v] = u
+                    in_degree[v] -= 1
+                    if in_degree[v] == 0:
+                        queue.append(v)
 
         if sink not in dist:
             return (-1, [])
 
-        # print(dist)
-        # print(parent)
-
-        # Reconstruct path
+        # Reconstruct path backwards from parent pointers
         path: List[str] = []
-        cur: Optional[str] = sink
-        while cur is not None:
-            path.append(cur)
-            cur = parent.get(cur)
+        curr_sig: Optional[str] = sink
+        while curr_sig is not None:
+            path.append(curr_sig)
+            curr_sig = parent.get(curr_sig)
         path.reverse()
 
         return (dist[sink], path)

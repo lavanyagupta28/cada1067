@@ -40,6 +40,7 @@ def main() -> None:
     )
     parser.add_argument(
         "-config",
+        "--config",
         metavar="<config_file_path>",
         default=os.path.join(_SCRIPT_DIR, "config.yaml"),
         help="Configuration file path (defaults to config.yaml beside this entrypoint).",
