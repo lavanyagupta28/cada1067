@@ -7729,7 +7729,7 @@ sat -prove {prove_signal} {prove_value} -verify
         }
 
     def collapse_inverter_pairs(self) -> dict:
-        """Collapse every NOT-to-NOT chain into a direct connection.
+        """Collapse every NOT-to-NOT chain into a direct connection in O(V + E) time.
 
         Consumers of the second inverter are rewired to the first inverter's
         input. The first inverter is removed only when it has no other fanout.
@@ -7744,102 +7744,136 @@ sat -prove {prove_signal} {prove_value} -verify
         gates_removed = 0
         boundary_buffers = 0
 
+        # Precompute Primary Output lookup set (including bus prefixes)
+        po_set: Set[str] = set(nl.primary_outputs)
+        for po in list(nl.primary_outputs):
+            if "[" in po:
+                po_set.add(po.split("[", 1)[0])
+
         def is_primary_output(sig: str) -> bool:
-            return sig in nl.primary_outputs or sig.split("[", 1)[0] in nl.primary_outputs
+            return sig in po_set or sig.split("[", 1)[0] in po_set
 
-        def used_by_dff(sig: str) -> bool:
-            return any(
-                sig in (dff.d, dff.ck, dff.rn, dff.sn)
-                for dff in nl.dffs.values()
-            )
+        # Fast consumer index:
+        # comb_consumers: sig -> list of (gate_node, input_pin_index)
+        comb_consumers: Dict[str, List[Tuple[GateNode, int]]] = {}
+        for node in nl.nodes.values():
+            for idx, inp in enumerate(node.inputs):
+                comb_consumers.setdefault(inp, []).append((node, idx))
 
-        def signal_is_used(sig: str) -> bool:
-            return (
-                is_primary_output(sig)
-                or used_by_dff(sig)
-                or any(sig in node.inputs for node in nl.nodes.values())
-            )
+        # dff_consumers: sig -> list of (dff, attr_name)
+        dff_consumers: Dict[str, List[Tuple[DFF, str]]] = {}
+        for dff in nl.dffs.values():
+            for attr in ("d", "ck", "rn", "sn"):
+                val = getattr(dff, attr)
+                if val:
+                    dff_consumers.setdefault(val, []).append((dff, attr))
+
+        # driver_of: output_sig -> GateNode
+        driver_of: Dict[str, GateNode] = {}
+        for node in nl.nodes.values():
+            driver_of[node.output] = node
+
+        dff_q_outputs: Set[str] = {dff.q for dff in nl.dffs.values()}
+
+        tombstones: Set[str] = set()
+
+        def signal_has_consumers(sig: str, ignore_gate_names: Set[str]) -> bool:
+            if is_primary_output(sig):
+                return True
+            for dff, attr in dff_consumers.get(sig, ()):
+                if getattr(dff, attr) == sig:
+                    return True
+            for consumer_gate, pin_idx in comb_consumers.get(sig, ()):
+                if consumer_gate.name not in ignore_gate_names:
+                    if pin_idx < len(consumer_gate.inputs) and consumer_gate.inputs[pin_idx] == sig:
+                        return True
+            return False
 
         def discard_unused_scalar_wire(sig: str) -> None:
             if (
                 sig in nl.wires
                 and sig not in nl.primary_inputs
                 and not is_primary_output(sig)
-                and not signal_is_used(sig)
-                and all(node.output != sig for node in nl.nodes.values())
-                and all(dff.q != sig for dff in nl.dffs.values())
+                and not signal_has_consumers(sig, ignore_gate_names=tombstones)
+                and sig not in driver_of
+                and sig not in dff_q_outputs
             ):
                 nl.wires.pop(sig, None)
 
         while True:
-            out2gate = {
-                node.output: inst_name
-                for inst_name, node in nl.nodes.items()
-            }
-            candidates: List[Tuple[str, str]] = []
-            for second_name, second in nl.nodes.items():
-                if second.gate_type != "not" or len(second.inputs) != 1:
+            # Discover candidate pairs using driver_of in O(NOT gates)
+            candidates: List[Tuple[GateNode, GateNode]] = []
+            for second in list(nl.nodes.values()):
+                if second.name in tombstones or second.gate_type != "not" or len(second.inputs) != 1:
                     continue
-                first_name = out2gate.get(second.inputs[0])
-                if first_name is None or first_name == second_name:
+                first = driver_of.get(second.inputs[0])
+                if first is None or first.name == second.name or first.name in tombstones:
                     continue
-                first = nl.nodes.get(first_name)
-                if first and first.gate_type == "not" and len(first.inputs) == 1:
-                    candidates.append((first_name, second_name))
+                if first.gate_type == "not" and len(first.inputs) == 1:
+                    candidates.append((first, second))
 
             if not candidates:
                 break
 
-            # Avoid processing overlapping chains from the same snapshot.
-            selected: List[Tuple[str, str]] = []
+            # Avoid overlapping chains in the same pass (identical to original selection semantics)
+            selected: List[Tuple[GateNode, GateNode]] = []
             occupied: Set[str] = set()
-            for first_name, second_name in candidates:
-                if first_name in occupied or second_name in occupied:
+            for first, second in candidates:
+                if first.name in occupied or second.name in occupied:
                     continue
-                selected.append((first_name, second_name))
-                occupied.update((first_name, second_name))
+                selected.append((first, second))
+                occupied.add(first.name)
+                occupied.add(second.name)
 
-            for first_name, second_name in selected:
-                first = nl.nodes.get(first_name)
-                second = nl.nodes.get(second_name)
-                if first is None or second is None:
-                    continue
-                if (
-                    first.gate_type != "not"
-                    or second.gate_type != "not"
-                    or second.inputs != [first.output]
-                ):
-                    continue
+            if not selected:
+                break
 
+            for first, second in selected:
                 source = first.inputs[0]
                 first_output = first.output
                 second_output = second.output
-                keep_boundary_net = is_primary_output(second_output) or used_by_dff(second_output)
 
-                # Internal combinational consumers can always bypass the pair.
-                for node_name, node in nl.nodes.items():
-                    if node_name != second_name:
-                        node.inputs = [source if sig == second_output else sig for sig in node.inputs]
+                keep_boundary_net = is_primary_output(second_output) or bool(dff_consumers.get(second_output))
+
+                # Rewire all combinational consumers of second_output to source in O(fanout)
+                for consumer_gate, pin_idx in comb_consumers.get(second_output, ()):
+                    if consumer_gate.name != second.name and consumer_gate.name not in tombstones:
+                        consumer_gate.inputs[pin_idx] = source
+                        comb_consumers.setdefault(source, []).append((consumer_gate, pin_idx))
+                comb_consumers[second_output] = []
 
                 if keep_boundary_net:
                     second.gate_type = "buf"
                     second.inputs = [source]
+                    comb_consumers.setdefault(source, []).append((second, 0))
+                    driver_of[second_output] = second
                     boundary_buffers += 1
                 else:
-                    for dff in nl.dffs.values():
-                        for attr in ("d", "ck", "rn", "sn"):
-                            if getattr(dff, attr) == second_output:
-                                setattr(dff, attr, source)
-                    nl.nodes.pop(second_name, None)
+                    for dff, attr in dff_consumers.get(second_output, ()):
+                        setattr(dff, attr, source)
+                        dff_consumers.setdefault(source, []).append((dff, attr))
+                    dff_consumers[second_output] = []
+
+                    tombstones.add(second.name)
+                    driver_of.pop(second_output, None)
                     gates_removed += 1
 
-                if not signal_is_used(first_output):
-                    nl.nodes.pop(first_name, None)
+                # Check if first_output has any remaining active consumers
+                if not signal_has_consumers(first_output, ignore_gate_names=tombstones | {second.name}):
+                    tombstones.add(first.name)
+                    driver_of.pop(first_output, None)
                     gates_removed += 1
 
                 discard_unused_scalar_wire(first_output)
                 discard_unused_scalar_wire(second_output)
                 pairs_collapsed += 1
+
+        # Delete all tombstones in one single batch
+        for name in tombstones:
+            nl.nodes.pop(name, None)
+
+        if hasattr(self, "_invalidate_comb_caches"):
+            self._invalidate_comb_caches()
 
         return {
             "pairs_collapsed": pairs_collapsed,
