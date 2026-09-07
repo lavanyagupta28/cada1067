@@ -401,6 +401,20 @@ class EDAAgent:
                 }
                 return json.dumps({"result": compact_result})
 
+        if tool_name in ("auto_insert_buffers", "insert_buffers_for_fanout"):
+            data = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if isinstance(data, dict):
+                compact_result = {
+                    "buffers_inserted": data.get("buffers_inserted", 0),
+                    "nets_processed": data.get("nets_processed", 1 if data.get("net_name") else 0),
+                    "net_name": data.get("net_name"),
+                }
+                if "per_net" in data:
+                    compact_result["sample_per_net"] = {
+                        k: data["per_net"][k] for k in list(data["per_net"].keys())[:3]
+                    }
+                return json.dumps({"result": compact_result})
+
         # A singular path is a bounded witness/counterexample, not a collection
         # of independent results.  Keep it intact so the LLM can report a valid
         # source-to-sink path, including its destination.  Bulk results use the
@@ -867,8 +881,15 @@ class EDAAgent:
             return f"replace_gate: {data.get('replaced')} → {data.get('new_type')}"
         elif tool_name == "replace_pattern":
             return f"replace_pattern: {data.get('replacements', 0)} replacements"
-        elif tool_name == "insert_buffers_for_fanout":
-            return f"insert_buffers_for_fanout: {data.get('buffers_inserted', 0)} buffers"
+        elif tool_name in ("insert_buffers_for_fanout", "auto_insert_buffers"):
+            bufs = data.get("buffers_inserted", 0)
+            nets_cnt = data.get("nets_processed")
+            if nets_cnt is not None:
+                return f"{tool_name}: {bufs} buffers inserted across {nets_cnt} nets"
+            net = data.get("net_name")
+            if net:
+                return f"{tool_name}: {bufs} buffers inserted on {net}"
+            return f"{tool_name}: {bufs} buffers inserted"
         elif tool_name == "insert_dedicated_buffers_for_loads":
             return (
                 f"insert_dedicated_buffers_for_loads: "
@@ -1747,8 +1768,12 @@ class EDAAgent:
             }
 
         if tool_name == "insert_buffers_for_fanout":
-            n = eng.insert_buffers_for_fanout(args["net_name"], args["max_fanout"])
-            return {"buffers_inserted": n}
+            net_name = args.get("net_name")
+            max_fanout = int(args["max_fanout"])
+            if net_name:
+                n = eng.insert_buffers_for_fanout(net_name, max_fanout)
+                return {"buffers_inserted": n}
+            return eng.insert_buffers_for_all_nets_exceeding_fanout(max_fanout)
 
         if tool_name == "insert_dedicated_buffers_for_loads":
             n = eng.insert_dedicated_buffers_for_loads(args["net_name"])
@@ -1757,41 +1782,7 @@ class EDAAgent:
         if tool_name == "auto_insert_buffers":
             max_fanout = int(args.get("max_fanout", 4))
             nets = args.get("nets")
-            processed = []
-            per_net = {}
-            total = 0
-
-            if not nets:
-                # Work from the complete internal load-pin inventory.  The
-                # user-facing list_signals() result is intentionally compact
-                # and therefore must not be used for exhaustive processing.
-                nl = eng.netlist
-                candidates = {
-                    input_signal
-                    for node in nl.nodes.values()
-                    for input_signal in node.inputs
-                }
-                candidates.update(
-                    signal
-                    for dff in nl.dffs.values()
-                    for signal in (dff.ck, dff.rn, dff.sn, dff.d)
-                    if signal
-                )
-                nets = sorted(candidates - {"1'b0", "1'b1"})
-
-            for net in nets:
-                try:
-                    fanout = eng.get_fanout(net)
-                except Exception:
-                    fanout = []
-                cnt = len(fanout)
-                if cnt > max_fanout:
-                    inserted = eng.insert_buffers_for_fanout(net, max_fanout)
-                    per_net[net] = {"before": cnt, "buffers_inserted": inserted}
-                    total += inserted
-                    processed.append(net)
-
-            return {"nets_processed": len(processed), "buffers_inserted": total, "per_net": per_net}
+            return eng.insert_buffers_for_all_nets_exceeding_fanout(max_fanout, nets=nets)
 
         if tool_name == "balance_depth":
             n = eng.balance_depth(args["source"], args["sinks"])

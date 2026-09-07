@@ -196,10 +196,135 @@ class EDAEngine:
         self._last_constant_input_report: Optional[dict] = None
         self._last_constant_input_matches: Optional[List[dict]] = None
         self._last_constant_input_signature: Optional[tuple] = None
+        # Combinational adjacency and graph index cache
+        self._comb_forward_adj: Optional[Dict[str, List[str]]] = None
+        self._comb_backward_adj: Optional[Dict[str, List[str]]] = None
+        self._cached_netlist_id: Optional[int] = None
+        self._cached_node_count: Optional[int] = None
+        # Fanout and signal index cache
+        self._fanout_index: Optional[Dict[str, List[Tuple[str, str, Any]]]] = None
+        self._cached_fo_netlist_id: Optional[int] = None
+        self._cached_fo_node_count: Optional[int] = None
+        self._cached_fo_dff_count: Optional[int] = None
+        self._known_signals: Optional[Set[str]] = None
+        self._cached_sig_netlist_id: Optional[int] = None
+        self._cached_sig_node_count: Optional[int] = None
 
     # ------------------------------------------------------------------
     # Netlist lifecycle
     # ------------------------------------------------------------------
+
+    def _invalidate_comb_caches(self, keep_fanout_index: bool = False) -> None:
+        """Clear cached combinational graph structures."""
+        self._comb_forward_adj = None
+        self._comb_backward_adj = None
+        self._cached_netlist_id = None
+        self._cached_node_count = None
+        if not keep_fanout_index:
+            self._known_signals = None
+            self._cached_sig_netlist_id = None
+            self._cached_sig_node_count = None
+            self._fanout_index = None
+            self._cached_fo_netlist_id = None
+            self._cached_fo_node_count = None
+            self._cached_fo_dff_count = None
+
+    def _ensure_fanout_index(self) -> Dict[str, List[Tuple[str, str, Any]]]:
+        """Lazily construct and cache the fanout/consumer index.
+
+        Maps: signal -> List of (load_kind, inst_name, pin_ref)
+        where load_kind in ('gate', 'dff').
+        For 'gate', pin_ref is int (index in node.inputs).
+        For 'dff', pin_ref is str (attribute name: 'd', 'ck', 'rn', 'sn').
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        if (
+            self._fanout_index is not None
+            and self._cached_fo_netlist_id == id(nl)
+            and self._cached_fo_node_count == len(nl.nodes)
+            and self._cached_fo_dff_count == len(nl.dffs)
+        ):
+            return self._fanout_index
+
+        index: Dict[str, List[Tuple[str, str, Any]]] = {}
+        for inst_name, node in nl.nodes.items():
+            for idx, inp in enumerate(node.inputs):
+                index.setdefault(inp, []).append(("gate", inst_name, idx))
+        for inst_name, dff in nl.dffs.items():
+            for attr in ("ck", "rn", "sn", "d"):
+                val = getattr(dff, attr)
+                if val:
+                    index.setdefault(val, []).append(("dff", inst_name, attr))
+
+        self._fanout_index = index
+        self._cached_fo_netlist_id = id(nl)
+        self._cached_fo_node_count = len(nl.nodes)
+        self._cached_fo_dff_count = len(nl.dffs)
+        return self._fanout_index
+
+    def _ensure_known_signals(self) -> Set[str]:
+        """Lazily construct and cache the set of all known valid signal names."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        if (
+            self._known_signals is not None
+            and self._cached_sig_netlist_id == id(nl)
+            and self._cached_sig_node_count == len(nl.nodes)
+        ):
+            return self._known_signals
+
+        known = (
+            set(nl.primary_inputs)
+            | set(nl.primary_outputs)
+            | set(nl.wires.keys())
+            | {n.output for n in nl.nodes.values()}
+            | {inp for n in nl.nodes.values() for inp in n.inputs}
+            | {dff.q for dff in nl.dffs.values()}
+            | {dff.d for dff in nl.dffs.values()}
+            | {"1'b0", "1'b1"}
+        )
+        self._known_signals = known
+        self._cached_sig_netlist_id = id(nl)
+        self._cached_sig_node_count = len(nl.nodes)
+        return self._known_signals
+
+    def _ensure_comb_adj(self) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Lazily construct and cache forward and backward combinational adjacency.
+
+        DFF boundaries (Q-to-D) are treated as cuts.
+        """
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        if (
+            self._comb_forward_adj is not None
+            and self._comb_backward_adj is not None
+            and self._cached_netlist_id == id(nl)
+            and self._cached_node_count == len(nl.nodes)
+        ):
+            return self._comb_forward_adj, self._comb_backward_adj
+
+        fwd: Dict[str, List[str]] = {}
+        bwd: Dict[str, List[str]] = {}
+
+        for node in nl.nodes.values():
+            out_sig = node.output
+            inputs = node.inputs
+            bwd[out_sig] = list(inputs)
+            for inp in inputs:
+                fwd.setdefault(inp, []).append(out_sig)
+
+        self._comb_forward_adj = fwd
+        self._comb_backward_adj = bwd
+        self._cached_netlist_id = id(nl)
+        self._cached_node_count = len(nl.nodes)
+        return fwd, bwd
 
     def load(self, filepath: str) -> Netlist:
         """Load a Verilog file into the engine and return the Netlist."""
@@ -259,30 +384,15 @@ class EDAEngine:
 
     def _build_fanout_map(self) -> Dict[str, List[str]]:
         """Map each net name → list of gate instance names that consume it."""
-        fanout: Dict[str, List[str]] = {}
-        for inst_name, node in self._netlist.nodes.items():  # type: ignore[union-attr]
-            for inp in node.inputs:
-                fanout.setdefault(inp, []).append(inst_name)
-        for inst_name, dff in self._netlist.dffs.items():  # type: ignore[union-attr]
-            for sig in (dff.ck, dff.rn, dff.sn, dff.d):
-                if sig:
-                    fanout.setdefault(sig, []).append(inst_name)
-        return fanout
+        fo_index = self._ensure_fanout_index()
+        return {
+            sig: [inst_name for _, inst_name, _ in pins]
+            for sig, pins in fo_index.items()
+        }
 
     def _resolve_signal(self, name: str) -> str:
         """Validate that *name* is a known signal; return it unchanged."""
-        nl = self._netlist
-        assert nl is not None
-        known = (
-            set(nl.primary_inputs)
-            | set(nl.primary_outputs)
-            | set(nl.wires.keys())
-            | {n.output for n in nl.nodes.values()}
-            | {inp for n in nl.nodes.values() for inp in n.inputs}
-            | {dff.q for dff in nl.dffs.values()}
-            | {dff.d for dff in nl.dffs.values()}
-            | {"1'b0", "1'b1"}
-        )
+        known = self._ensure_known_signals()
         if name not in known:
             raise ValueError(f"Signal {name!r} not found in netlist.")
         return name
@@ -297,18 +407,32 @@ class EDAEngine:
 
     def _next_inst_name(self, prefix: str = "U_gen") -> str:
         """Generate a unique gate instance name."""
-        self._instance_counter += 1
-        return f"{prefix}_{self._instance_counter}"
+        nl = self._netlist
+        while True:
+            self._instance_counter += 1
+            name = f"{prefix}_{self._instance_counter}"
+            if nl is None or (name not in nl.nodes and name not in nl.dffs):
+                return name
 
     def _next_wire_name(self, prefix: str = "w_gen") -> str:
         """Generate a unique internal wire name."""
-        self._instance_counter += 1
-        return f"{prefix}_{self._instance_counter}"
+        nl = self._netlist
+        while True:
+            self._instance_counter += 1
+            name = f"{prefix}_{self._instance_counter}"
+            if nl is None or (
+                name not in nl.wires
+                and name not in nl.primary_inputs
+                and name not in nl.primary_outputs
+            ):
+                return name
 
     def _add_wire(self, name: str) -> None:
         """Register an internal wire in the netlist."""
         assert self._netlist is not None
         self._netlist.wires[name] = WireInfo(name=name, width=1, is_bus=False)
+        if self._known_signals is not None:
+            self._known_signals.add(name)
 
     # ------------------------------------------------------------------
     # Analysis: signal-level graph (treating each signal as a node)
@@ -2275,7 +2399,8 @@ class EDAEngine:
         """
         self._require_netlist()
         self._resolve_signal(net_name)
-        return self._build_fanout_map().get(net_name, [])
+        fo_index = self._ensure_fanout_index()
+        return [inst_name for _, inst_name, _ in fo_index.get(net_name, ())]
 
     def get_fanout_report(self, net_name: str, inline_limit: int = 10) -> dict:
         """Return a compact fanout report, spilling large lists to a CWD file."""
@@ -5546,7 +5671,7 @@ sat -prove {prove_signal} {prove_value} -verify
         return buf_inst
 
     def insert_buffers_for_fanout(self, net_name: str, max_fanout: int) -> int:
-        """Insert buffer trees so no net has fanout > max_fanout.
+        """Insert buffer trees so no net has fanout > max_fanout in O(F) time.
 
         Args:
             net_name:   Net to examine and buffer.
@@ -5565,30 +5690,16 @@ sat -prove {prove_signal} {prove_value} -verify
         nl = self._netlist
         assert nl is not None
 
-        def load_pins(signal: str):
-            """Return mutable references to each individual load pin."""
-            pins = []
-            for inst_name, node in nl.nodes.items():
-                for input_index, input_signal in enumerate(node.inputs):
-                    if input_signal == signal:
-                        pins.append(("gate", inst_name, input_index))
-            for inst_name, dff in nl.dffs.items():
-                for attr_name in ("ck", "rn", "sn", "d"):
-                    if getattr(dff, attr_name) == signal:
-                        pins.append(("dff", inst_name, attr_name))
-            return pins
+        fo_index = self._ensure_fanout_index()
+        current_pins = fo_index.get(net_name, ())
+        if len(current_pins) <= max_fanout:
+            return 0
 
+        queue: deque[Tuple[str, str, Any]] = deque(current_pins)
         total_inserted = 0
-        while True:
-            pins = load_pins(net_name)
-            if len(pins) <= max_fanout:
-                break
 
-            # Replacing F load pins with one buffer input reduces the source
-            # fanout by F-1. Repeating this constructs a minimum-size tree;
-            # once source-level buffers themselves are grouped, it naturally
-            # becomes multilevel.
-            group = pins[:max_fanout]
+        while len(queue) > max_fanout:
+            group = [queue.popleft() for _ in range(max_fanout)]
             new_wire = self._next_wire_name("fo_w")
             buf_inst = self._next_inst_name("fo_buf")
             self._add_wire(new_wire)
@@ -5605,9 +5716,66 @@ sat -prove {prove_signal} {prove_value} -verify
                 inputs=[net_name],
                 output=new_wire,
             )
+
+            # Register the new wire's consumers in the fanout index
+            fo_index[new_wire] = group
+
+            # The new buffer consumes net_name at pin 0
+            queue.append(("gate", buf_inst, 0))
             total_inserted += 1
 
+        # Update remaining direct consumers of net_name in the fanout index
+        fo_index[net_name] = list(queue)
+
+        # Sync cache counts so subsequent calls in the batch recognize incremental validity
+        self._cached_fo_node_count = len(nl.nodes)
+        self._cached_sig_node_count = len(nl.nodes)
+
+        # Invalidate combinational caches while preserving the incrementally updated fanout index
+        self._invalidate_comb_caches(keep_fanout_index=True)
         return total_inserted
+
+    def insert_buffers_for_all_nets_exceeding_fanout(
+        self, max_fanout: int, nets: Optional[List[str]] = None
+    ) -> dict:
+        """Insert buffer trees on all nets exceeding max_fanout.
+
+        Args:
+            max_fanout: Maximum allowed fanout per net.
+            nets: Optional explicit list of nets to process (default: all candidate nets).
+
+        Returns:
+            dict with 'nets_processed', 'buffers_inserted', 'per_net'.
+        """
+        self._require_netlist()
+        fo_index = self._ensure_fanout_index()
+
+        if nets:
+            candidate_nets = [net for net in nets if net not in ("1'b0", "1'b1")]
+        else:
+            # Directly select nets exceeding max_fanout in O(signals)
+            candidate_nets = sorted(
+                sig for sig, pins in fo_index.items()
+                if len(pins) > max_fanout and sig not in ("1'b0", "1'b1")
+            )
+
+        total = 0
+        per_net = {}
+        processed = []
+
+        for net in candidate_nets:
+            cnt = len(fo_index.get(net, ()))
+            if cnt > max_fanout:
+                inserted = self.insert_buffers_for_fanout(net, max_fanout)
+                per_net[net] = {"before": cnt, "buffers_inserted": inserted}
+                total += inserted
+                processed.append(net)
+
+        return {
+            "nets_processed": len(processed),
+            "buffers_inserted": total,
+            "per_net": per_net,
+        }
 
     def insert_dedicated_buffers_for_loads(self, net_name: str) -> int:
         """Insert one buffer per current direct load of net_name.
