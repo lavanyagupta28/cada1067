@@ -23,6 +23,18 @@ class IOHandler:
         self._log_path: Optional[Path] = None
         self._response_counter: int = 0
 
+        # Ensure UTF-8 I/O encoding on Windows without encoding exceptions
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+        if hasattr(sys.stdin, "reconfigure"):
+            try:
+                sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------

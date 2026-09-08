@@ -14,5 +14,6 @@ docs/
 src/__pycache__/*
 config.yaml
 *test*
+!scripts/*.py
 *output*
 scripts/log*

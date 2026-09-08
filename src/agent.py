@@ -36,12 +36,14 @@ class _Timeout:
         raise TimeoutError(f"Operation timed out after {self.seconds} s")
 
     def __enter__(self) -> "_Timeout":
-        _signal.signal(_signal.SIGALRM, self._handler)
-        _signal.alarm(self.seconds)
+        if hasattr(_signal, "SIGALRM") and hasattr(_signal, "alarm"):
+            _signal.signal(_signal.SIGALRM, self._handler)
+            _signal.alarm(self.seconds)
         return self
 
     def __exit__(self, *args: Any) -> None:
-        _signal.alarm(0)
+        if hasattr(_signal, "alarm"):
+            _signal.alarm(0)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +111,7 @@ class EDAAgent:
 
         # Developer mode — when enabled, loads the conversation logger
         dev_cfg = config.get("developer", {})
-        self._developer_mode: bool = bool(dev_cfg.get("mode", False))
+        self._developer_mode: bool = bool(dev_cfg.get("mode", False) or config.get("developer_mode", False))
         if self._developer_mode:
             from .developer import ConversationLogger, NoopLogger, get_logs_dir, extract_case_name  # noqa: E501
             log_base = dev_cfg.get("log_dir", None)
@@ -1363,6 +1365,8 @@ class EDAAgent:
                     f"LLM call timed out after {timeout} seconds."
                 )
             except Exception as exc:
+                if "credit_balance_exhausted" in str(exc) or "insufficient_quota" in str(exc):
+                    raise RuntimeError(f"OpenAI API quota exhausted: {exc}") from exc
                 if not self._is_rate_limit_error(exc):
                     raise RuntimeError(f"OpenAI API error: {exc}") from exc
                 if attempt >= self._rate_limit_max_retries:
