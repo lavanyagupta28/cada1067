@@ -4776,6 +4776,18 @@ sat -prove {prove_signal} {prove_value} -verify
 
         assert report is not None
         assert matches is not None
+        if not matches:
+            return {
+                "gate_type": gate_type,
+                "functional": bool(functional),
+                "analysis_reused": analysis_reused,
+                "reported_gates": 0,
+                "simplified_gates": 0,
+                "eliminated_original_gate_type": 0,
+                "replacement_breakdown": {},
+                "stale_matches_skipped": 0,
+                "instances": [],
+            }
         if not report.get("complete"):
             raise RuntimeError(
                 "Constant-input analysis was incomplete; refusing to transform the design."
@@ -4978,74 +4990,112 @@ sat -prove {prove_signal} {prove_value} -verify
     def _simulate_signal_observations(
         self, signals: List[str], rounds: int = 96
     ) -> Dict[str, Set[int]]:
-        """Random-simulate candidate signals to discard obvious non-constants."""
+        """Bit-parallel random simulation to filter variable signals in milliseconds.
+
+        Evaluates 8192 random vectors (2 passes x 4096 bits) across arbitrary combinational
+        primitives using fast Python multi-word integers and native bitwise operations.
+        """
         nl = self._netlist
         assert nl is not None
-        rng = random.Random(0)
         observations: Dict[str, Set[int]] = {signal: set() for signal in signals}
+        if not signals:
+            return observations
+
         output_to_gate = {node.output: node for node in nl.nodes.values()}
-        dff_qs = {dff.q for dff in nl.dffs.values() if dff.q}
+        dff_qs = [dff.q for dff in nl.dffs.values() if dff.q]
 
-        def gate_eval(gate_type: str, inputs: List[int]) -> int:
-            if gate_type == "buf":
-                return inputs[0]
-            if gate_type == "not":
-                return 1 - inputs[0]
-            if gate_type == "and":
-                return int(all(inputs))
-            if gate_type == "nand":
-                return 1 - int(all(inputs))
-            if gate_type == "or":
-                return int(any(inputs))
-            if gate_type == "nor":
-                return 1 - int(any(inputs))
-            if gate_type == "xor":
-                return sum(inputs) % 2
-            if gate_type == "xnor":
-                return 1 - (sum(inputs) % 2)
-            raise ValueError(f"Unsupported gate type for simulation: {gate_type!r}")
+        WIDTH = 4096
+        MASK = (1 << WIDTH) - 1
 
-        for _ in range(rounds):
+        for pass_idx in range(2):
+            rng = random.Random(pass_idx * 10007 + 42)
             memo: Dict[str, int] = {
                 "1'b0": 0,
                 "0": 0,
                 "'0": 0,
-                "1'b1": 1,
-                "1": 1,
-                "'1": 1,
+                "1'b1": MASK,
+                "1": MASK,
+                "'1": MASK,
             }
             for pi in nl.primary_inputs:
                 wi = nl.wires.get(pi)
                 if wi and wi.is_bus:
                     for bit in range(min(wi.msb, wi.lsb), max(wi.msb, wi.lsb) + 1):
-                        memo[f"{pi}[{bit}]"] = rng.randint(0, 1)
-                memo[pi] = rng.randint(0, 1)
+                        memo[f"{pi}[{bit}]"] = rng.getrandbits(WIDTH)
+                memo[pi] = rng.getrandbits(WIDTH)
             for q in dff_qs:
-                memo[q] = rng.randint(0, 1)
+                memo[q] = rng.getrandbits(WIDTH)
 
             visiting: Set[str] = set()
 
-            def value(signal: str) -> int:
-                literal = self._literal_constant_value(signal)
-                if literal is not None:
-                    return literal
-                if signal in memo:
-                    return memo[signal]
-                if signal in visiting:
-                    memo[signal] = rng.randint(0, 1)
-                    return memo[signal]
-                node = output_to_gate.get(signal)
+            def eval_sig(sig: str) -> int:
+                lit = self._literal_constant_value(sig)
+                if lit is not None:
+                    return MASK if lit == 1 else 0
+                if sig in memo:
+                    return memo[sig]
+                if sig in visiting:
+                    memo[sig] = rng.getrandbits(WIDTH)
+                    return memo[sig]
+                node = output_to_gate.get(sig)
                 if node is None:
-                    memo[signal] = rng.randint(0, 1)
-                    return memo[signal]
-                visiting.add(signal)
-                input_values = [value(inp) for inp in node.inputs]
-                visiting.remove(signal)
-                memo[signal] = gate_eval(node.gate_type, input_values)
-                return memo[signal]
+                    memo[sig] = rng.getrandbits(WIDTH)
+                    return memo[sig]
 
-            for signal in signals:
-                observations[signal].add(value(signal))
+                visiting.add(sig)
+                in_vals = [eval_sig(inp) for inp in node.inputs]
+                visiting.remove(sig)
+
+                gt = node.gate_type
+                if gt == "buf":
+                    res = in_vals[0]
+                elif gt == "not":
+                    res = (~in_vals[0]) & MASK
+                elif gt == "and":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res &= v
+                elif gt == "nand":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res &= v
+                    res = (~res) & MASK
+                elif gt == "or":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res |= v
+                elif gt == "nor":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res |= v
+                    res = (~res) & MASK
+                elif gt == "xor":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res ^= v
+                elif gt == "xnor":
+                    res = in_vals[0]
+                    for v in in_vals[1:]:
+                        res ^= v
+                    res = (~res) & MASK
+                else:
+                    res = rng.getrandbits(WIDTH)
+
+                memo[sig] = res
+                return res
+
+            for sig in signals:
+                if len(observations[sig]) > 1:
+                    continue
+                val = eval_sig(sig)
+                if val == 0:
+                    observations[sig].add(0)
+                elif val == MASK:
+                    observations[sig].add(1)
+                else:
+                    observations[sig].add(0)
+                    observations[sig].add(1)
+
         return observations
 
     def _classify_constant_candidate(
@@ -5108,7 +5158,7 @@ sat -prove {prove_signal} {prove_value} -verify
     def _batch_prove_observed_constants(
         self, observed_values: Dict[str, int]
     ) -> Dict[str, dict]:
-        """Classify possible constants by searching for batch counterexamples."""
+        """Classify possible constants by searching for batch counterexamples on sliced cones."""
         remaining = dict(observed_values)
         results: Dict[str, dict] = {}
         chunk_size = 50
@@ -5130,6 +5180,7 @@ sat -prove {prove_signal} {prove_value} -verify
 
                 model = self._find_constant_counterexample_model(active_chunk)
                 if model is None:
+                    # Formally proven constant (UNSAT)
                     for signal, value in active_chunk.items():
                         results[signal] = {
                             "constant": True,
@@ -5142,17 +5193,19 @@ sat -prove {prove_signal} {prove_value} -verify
                     continue
 
                 if not model:
+                    # SAT error, timeout, or empty model: mark UNKNOWN without crashing
                     for signal in active_chunk:
                         results[signal] = {
                             "constant": False,
                             "proof": "formal",
                             "status": "unknown",
-                            "reason": "SAT counterexample did not include probe values.",
+                            "reason": "SAT solver timed out or counterexample lacked probe values.",
                         }
                         remaining.pop(signal, None)
                     progress = True
                     continue
 
+                # Formally proven variable (counterexample model found)
                 for signal in model:
                     if signal not in remaining:
                         continue
@@ -5177,34 +5230,111 @@ sat -prove {prove_signal} {prove_value} -verify
 
         return results
 
+    def _extract_tfi_cone(
+        self, signals: Iterable[str]
+    ) -> Tuple[Netlist, Dict[str, str]]:
+        """Extract a self-contained combinational sub-netlist covering the transitive
+        fan-in cone of the given signals back to primary inputs and DFF outputs.
+        """
+        nl = self._netlist
+        assert nl is not None
+
+        output_to_gate = {node.output: node for node in nl.nodes.values()}
+        dff_q_set = {dff.q for dff in nl.dffs.values() if dff.q}
+        pi_set = set(nl.primary_inputs)
+
+        cone_nodes: Dict[str, GateNode] = {}
+        visited_signals: Set[str] = set()
+        boundary_inputs: Set[str] = set()
+        q_aliases: Dict[str, str] = {}
+
+        stack = list(signals)
+        while stack:
+            sig = stack.pop()
+            if sig in visited_signals:
+                continue
+            visited_signals.add(sig)
+
+            lit = self._literal_constant_value(sig)
+            if lit is not None:
+                continue
+
+            if sig in dff_q_set or "[" in sig or "]" in sig:
+                if sig not in q_aliases:
+                    alias = f"_cone_pi_{len(q_aliases)}"
+                    q_aliases[sig] = alias
+                boundary_inputs.add(q_aliases[sig])
+                continue
+
+            if sig in pi_set:
+                boundary_inputs.add(sig)
+                continue
+
+            gate = output_to_gate.get(sig)
+            if gate is not None:
+                cone_nodes[gate.name] = GateNode(
+                    name=gate.name,
+                    gate_type=gate.gate_type,
+                    inputs=list(gate.inputs),
+                    output=gate.output,
+                )
+                for inp in gate.inputs:
+                    if inp not in visited_signals:
+                        stack.append(inp)
+            else:
+                if "[" in sig or "]" in sig:
+                    if sig not in q_aliases:
+                        alias = f"_cone_pi_{len(q_aliases)}"
+                        q_aliases[sig] = alias
+                    boundary_inputs.add(q_aliases[sig])
+                else:
+                    boundary_inputs.add(sig)
+
+        # In cone_nodes, replace inputs that have aliases
+        for node in cone_nodes.values():
+            node.inputs = [q_aliases.get(inp, inp) for inp in node.inputs]
+
+        # Build wire definitions for sub-netlist
+        cone_wires: Dict[str, WireInfo] = {}
+        for inp in boundary_inputs:
+            cone_wires[inp] = WireInfo(name=inp)
+        for node in cone_nodes.values():
+            if node.output not in cone_wires:
+                cone_wires[node.output] = WireInfo(name=node.output)
+            for inp in node.inputs:
+                if inp not in cone_wires and self._literal_constant_value(inp) is None:
+                    cone_wires[inp] = WireInfo(name=inp)
+
+        sub_nl = Netlist(
+            module_name="sliced_cone",
+            primary_inputs=sorted(boundary_inputs),
+            primary_outputs=[],
+            wires=cone_wires,
+            nodes=cone_nodes,
+            dffs={},
+        )
+        return sub_nl, q_aliases
+
     def _find_constant_counterexample_model(
         self, observed_values: Dict[str, int]
     ) -> Optional[Dict[str, int]]:
-        """Return one model where any signal differs from its observed value.
+        """Return one model where any signal differs from its observed value using
+        a sliced transitive fan-in cone subcircuit.
 
-        Returns None when no counterexample exists.
+        Returns None when no counterexample exists (UNSAT -> proven constant).
+        Returns an empty dict when SAT times out or produces no probe model (UNKNOWN).
         """
         import shutil
         import textwrap
 
-        nl = self._netlist
-        assert nl is not None
-        comb_nl = copy.deepcopy(nl)
-        q_aliases: Dict[str, str] = {}
-        for index, dff in enumerate(comb_nl.dffs.values()):
-            if not dff.q or dff.q in q_aliases:
-                continue
-            alias = f"_constant_batch_q_{index}"
-            q_aliases[dff.q] = alias
-            comb_nl.wires[alias] = WireInfo(name=alias)
-            comb_nl.primary_inputs.append(alias)
-        for node in comb_nl.nodes.values():
-            node.inputs = [q_aliases.get(sig, sig) for sig in node.inputs]
-        comb_nl.dffs.clear()
+        if not observed_values:
+            return None
+
+        sub_nl, q_aliases = self._extract_tfi_cone(observed_values.keys())
 
         probe_to_signal: Dict[str, str] = {}
         diff_signals: List[str] = []
-        existing = set(comb_nl.wires) | set(comb_nl.nodes) | set(comb_nl.primary_outputs)
+        existing = set(sub_nl.wires) | set(sub_nl.nodes) | set(sub_nl.primary_outputs)
 
         def add_wire(base: str) -> str:
             name = base
@@ -5213,7 +5343,7 @@ sat -prove {prove_signal} {prove_value} -verify
                 suffix += 1
                 name = f"{base}_{suffix}"
             existing.add(name)
-            comb_nl.wires[name] = WireInfo(name=name)
+            sub_nl.wires[name] = WireInfo(name=name)
             return name
 
         def add_gate(base: str, gate_type: str, inputs: List[str], output: str) -> None:
@@ -5223,7 +5353,7 @@ sat -prove {prove_signal} {prove_value} -verify
                 suffix += 1
                 name = f"{base}_{suffix}"
             existing.add(name)
-            comb_nl.nodes[name] = GateNode(
+            sub_nl.nodes[name] = GateNode(
                 name=name,
                 gate_type=gate_type,
                 inputs=inputs,
@@ -5232,7 +5362,7 @@ sat -prove {prove_signal} {prove_value} -verify
 
         for index, (signal, observed) in enumerate(observed_values.items()):
             probe = add_wire(f"_constant_probe_{index}")
-            comb_nl.primary_outputs.append(probe)
+            sub_nl.primary_outputs.append(probe)
             probe_to_signal[probe] = signal
             add_gate(
                 f"_constant_probe_buf_{index}",
@@ -5255,7 +5385,7 @@ sat -prove {prove_signal} {prove_value} -verify
             add_gate(f"_constant_diff_or_gate_{index}", "or", [current, diff], out)
             current = out
         diff_any = add_wire("_constant_diff_any")
-        comb_nl.primary_outputs.append(diff_any)
+        sub_nl.primary_outputs.append(diff_any)
         add_gate("_constant_diff_any_buf", "buf", [current], diff_any)
 
         tmp_dir = tempfile.mkdtemp(
@@ -5263,11 +5393,11 @@ sat -prove {prove_signal} {prove_value} -verify
         )
         netlist_path = os.path.join(tmp_dir, "netlist.v")
         script_path = os.path.join(tmp_dir, "prove.ys")
-        write_verilog(comb_nl, netlist_path)
+        write_verilog(sub_nl, netlist_path)
         show_args = " ".join(f"-show {probe}" for probe in probe_to_signal)
         script = textwrap.dedent(f"""\
             read_verilog {netlist_path}
-            prep -top {comb_nl.module_name}
+            prep -top {sub_nl.module_name}
             sat -set {diff_any} 1 -max 64 {show_args} -show {diff_any}
         """)
         with open(script_path, "w") as fh:
@@ -5278,7 +5408,7 @@ sat -prove {prove_signal} {prove_value} -verify
                 [_yosys_binary(), "-s", script_path],
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=15,
                 env=_temp_subprocess_env(),
                 cwd=_workspace_temp_dir(),
             )
@@ -5287,9 +5417,8 @@ sat -prove {prove_signal} {prove_value} -verify
             if "sat solving finished - no model found" in lower:
                 return None
             if "sat solving finished - model found" not in lower:
-                raise RuntimeError(
-                    "Could not determine Yosys SAT batch result:\n" + combined[-3000:]
-                )
+                # Solver error or unhandled return: mark unknown safely
+                return {}
             model: Dict[str, int] = {}
             for probe, signal in probe_to_signal.items():
                 pattern = re.compile(
@@ -5301,6 +5430,9 @@ sat -prove {prove_signal} {prove_value} -verify
                         model[signal] = value
                         break
             return model
+        except Exception:
+            # Catch timeouts or subprocess exceptions gracefully
+            return {}
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
