@@ -3280,16 +3280,8 @@ class EDAEngine:
             "cone_gate_count": len(cone_nodes),
         }
 
-    def check_signal_equivalence(self, sig1: str, sig2: str) -> bool:
-        """Check if two signals in the current netlist are functionally equivalent.
-
-        Uses Yosys SAT solver to verify equivalence.
-        Returns True if both signals produce identical logic for all inputs.
-
-        Args:
-            sig1: First signal name to compare.
-            sig2: Second signal name to compare.
-        """
+    def _old_check_signal_equivalence(self, sig1: str, sig2: str) -> bool:
+        """Original unoptimized check_signal_equivalence preserved for baseline benchmarking."""
         self._require_netlist()
         nl = self._netlist
         assert nl is not None
@@ -3301,9 +3293,6 @@ class EDAEngine:
         self._resolve_signal(sig1)
         self._resolve_signal(sig2)
 
-        # Signal equivalence is combinational: primary inputs and DFF-Q values
-        # are independent boundaries. Replace each DFF-Q with a fresh PI so SAT
-        # never depends on a sequential-cell model.
         comb_nl = copy.deepcopy(nl)
         q_aliases: Dict[str, str] = {}
         for index, dff in enumerate(comb_nl.dffs.values()):
@@ -3322,9 +3311,6 @@ class EDAEngine:
         if sat_sig1 == sat_sig2:
             return True
 
-        # `prep` removes unobserved internal wires before the SAT pass. Expose
-        # queried internal signals as outputs in this temporary copy so their
-        # names and drivers remain available to `sat -set`.
         for signal_name in (sat_sig1, sat_sig2):
             if (
                 signal_name not in {"1'b0", "1'b1"}
@@ -3333,7 +3319,6 @@ class EDAEngine:
             ):
                 comb_nl.primary_outputs.append(signal_name)
 
-        # Write netlist to temporary file
         tf = tempfile.NamedTemporaryFile(
             "w", suffix=".v", dir=_workspace_temp_dir(), delete=False
         )
@@ -3354,6 +3339,330 @@ class EDAEngine:
                 os.unlink(netlist_path)
             except OSError:
                 pass
+
+    def check_signal_equivalence(self, sig1: str, sig2: str) -> bool:
+        """Check if two signals in the current netlist are functionally equivalent.
+
+        Uses fast path, bit-parallel random simulation filter, minimal TFI cone
+        slicing, compliant port aliasing for bus bit-selects, and single-pass
+        XOR miter SAT solving.
+
+        Args:
+            sig1: First signal name to compare.
+            sig2: Second signal name to compare.
+
+        Returns:
+            True if both signals produce identical logic for all inputs, False otherwise.
+        """
+        detail = self._check_signal_equivalence_detailed(sig1, sig2)
+        return detail["equivalent"]
+
+    def _check_signal_equivalence_detailed(self, sig1: str, sig2: str) -> dict:
+        """Detailed signal equivalence check returning performance and path metrics."""
+        self._require_netlist()
+        nl = self._netlist
+        assert nl is not None
+
+        orig_gate_count = len(nl.nodes)
+        constant_aliases = {
+            "0": "1'b0", "1": "1'b1", "'0": "1'b0", "'1": "1'b1"
+        }
+        sig1 = constant_aliases.get(sig1.strip().lower(), sig1)
+        sig2 = constant_aliases.get(sig2.strip().lower(), sig2)
+        self._resolve_signal(sig1)
+        self._resolve_signal(sig2)
+
+        # Stage A: Fast Path (Identity & Constant Comparison)
+        if sig1 == sig2:
+            return {
+                "equivalent": True,
+                "path": "identity",
+                "original_nodes": orig_gate_count,
+                "tfi_nodes": 0,
+                "yosys_calls": 0,
+                "error": "",
+            }
+
+        if sig1 in {"1'b0", "1'b1"} and sig2 in {"1'b0", "1'b1"}:
+            return {
+                "equivalent": (sig1 == sig2),
+                "path": "constant",
+                "original_nodes": orig_gate_count,
+                "tfi_nodes": 0,
+                "yosys_calls": 0,
+                "error": "",
+            }
+
+        # Build combinational netlist view: replace DFF-Q boundaries with independent PIs
+        comb_nodes = {name: copy.copy(node) for name, node in nl.nodes.items()}
+        q_aliases: Dict[str, str] = {}
+        for index, dff in enumerate(nl.dffs.values()):
+            if not dff.q or dff.q in q_aliases:
+                continue
+            alias = f"_signal_equiv_q_{index}"
+            q_aliases[dff.q] = alias
+
+        for node in comb_nodes.values():
+            if any(inp in q_aliases for inp in node.inputs):
+                node.inputs = [q_aliases.get(inp, inp) for inp in node.inputs]
+
+        target1 = q_aliases.get(sig1, sig1)
+        target2 = q_aliases.get(sig2, sig2)
+
+        if target1 == target2:
+            return {
+                "equivalent": True,
+                "path": "identity",
+                "original_nodes": orig_gate_count,
+                "tfi_nodes": 0,
+                "yosys_calls": 0,
+                "error": "",
+            }
+
+        # Stage B: Fast Bit-Parallel Random Combinational Simulation Filter
+        sim_inequiv = self._simulate_signal_pair(comb_nodes, target1, target2, sim_width=4096, passes=2)
+        if sim_inequiv is False:
+            return {
+                "equivalent": False,
+                "path": "simulation",
+                "original_nodes": orig_gate_count,
+                "tfi_nodes": 0,
+                "yosys_calls": 0,
+                "error": "",
+            }
+
+        # Stage C & D: Minimal Transitive Fan-In (TFI) Cone Slicing & Safe Port Aliasing
+        miter_verilog, tfi_gate_count = self._extract_signal_pair_tfi_miter(
+            comb_nodes, target1, target2
+        )
+
+        # Stage E & F: Single-Pass XOR Miter SAT Proof with Resilient Error Handling
+        sat_equiv, yosys_calls, sat_err = self._prove_miter_satisfiability(miter_verilog)
+
+        return {
+            "equivalent": bool(sat_equiv),
+            "path": "SAT",
+            "original_nodes": orig_gate_count,
+            "tfi_nodes": tfi_gate_count,
+            "yosys_calls": yosys_calls,
+            "error": sat_err,
+        }
+
+    def _simulate_signal_pair(
+        self,
+        comb_nodes: Dict[str, GateNode],
+        target1: str,
+        target2: str,
+        sim_width: int = 4096,
+        passes: int = 2,
+    ) -> Optional[bool]:
+        """Bit-parallel random combinational simulation to filter out inequivalent pairs.
+
+        Returns False if a mismatch is proven.
+        Returns None if simulation finds no mismatch (proceed to exact SAT).
+        """
+        out_to_node: Dict[str, GateNode] = {node.output: node for node in comb_nodes.values()}
+        mask = (1 << sim_width) - 1
+
+        for _ in range(passes):
+            memo: Dict[str, int] = {
+                "1'b0": 0,
+                "1'b1": mask,
+            }
+            visiting: Set[str] = set()
+
+            def eval_sig(sig: str) -> int:
+                if sig in memo:
+                    return memo[sig]
+                if sig in visiting:
+                    raise RecursionError("Combinational loop detected")
+                visiting.add(sig)
+
+                node = out_to_node.get(sig)
+                if node is None:
+                    # External boundary (PI, DFF-Q, or undriven wire)
+                    val = random.getrandbits(sim_width)
+                    memo[sig] = val
+                    visiting.remove(sig)
+                    return val
+
+                in_vals = [eval_sig(inp) for inp in node.inputs]
+                gt = node.gate_type.lower()
+                if gt == "not":
+                    res = (~in_vals[0]) & mask
+                elif gt == "buf":
+                    res = in_vals[0]
+                elif gt == "and":
+                    res = in_vals[0] & in_vals[1]
+                elif gt == "nand":
+                    res = (~(in_vals[0] & in_vals[1])) & mask
+                elif gt == "or":
+                    res = in_vals[0] | in_vals[1]
+                elif gt == "nor":
+                    res = (~(in_vals[0] | in_vals[1])) & mask
+                elif gt == "xor":
+                    res = in_vals[0] ^ in_vals[1]
+                elif gt == "xnor":
+                    res = (~(in_vals[0] ^ in_vals[1])) & mask
+                else:
+                    visiting.remove(sig)
+                    raise ValueError(f"Unsupported gate type in simulation: {gt}")
+
+                memo[sig] = res
+                visiting.remove(sig)
+                return res
+
+            try:
+                v1 = eval_sig(target1)
+                v2 = eval_sig(target2)
+                if v1 != v2:
+                    return False
+            except (RecursionError, ValueError):
+                return None
+
+        return None
+
+    def _extract_signal_pair_tfi_miter(
+        self,
+        comb_nodes: Dict[str, GateNode],
+        target1: str,
+        target2: str,
+    ) -> Tuple[str, int]:
+        """Extract minimal TFI cone for {target1, target2} and generate an XOR miter Verilog module.
+
+        All module port names are guaranteed to be clean, legal Verilog identifiers
+        without brackets or punctuation, completely preventing syntax errors on bus bit-selects.
+        """
+        out_to_node: Dict[str, GateNode] = {node.output: node for node in comb_nodes.values()}
+        queue = deque([target1, target2])
+        visited_sigs: Set[str] = set()
+        needed_nodes: Dict[str, GateNode] = {}
+        boundary_inputs: Set[str] = set()
+
+        while queue:
+            sig = queue.popleft()
+            if sig in visited_sigs or sig in {"1'b0", "1'b1"}:
+                continue
+            visited_sigs.add(sig)
+            node = out_to_node.get(sig)
+            if node is not None:
+                needed_nodes[node.name] = node
+                for inp in node.inputs:
+                    if inp not in {"1'b0", "1'b1"}:
+                        queue.append(inp)
+            else:
+                boundary_inputs.add(sig)
+
+        # Create legal identifiers for all boundary inputs
+        pi_alias_map: Dict[str, str] = {}
+        for idx, sig in enumerate(sorted(boundary_inputs)):
+            pi_alias_map[sig] = f"_miter_pi_{idx}"
+
+        # Create legal identifiers for internal wires that contain brackets or special chars
+        sig_alias_map: Dict[str, str] = dict(pi_alias_map)
+        for idx, node in enumerate(needed_nodes.values()):
+            out_sig = node.output
+            if "[" in out_sig or "]" in out_sig or not out_sig.isidentifier():
+                if out_sig not in sig_alias_map:
+                    sig_alias_map[out_sig] = f"_miter_wire_{idx}"
+
+        def clean_sig(s: str) -> str:
+            if s in {"1'b0", "1'b1"}:
+                return s
+            return sig_alias_map.get(s, s)
+
+        clean_t1 = clean_sig(target1)
+        clean_t2 = clean_sig(target2)
+
+        # Build clean Verilog miter module
+        pi_ports = [pi_alias_map[s] for s in sorted(boundary_inputs)]
+        all_ports = pi_ports + ["_miter_diff_out"]
+
+        lines = [
+            "module _signal_equiv_miter (",
+            "  " + ", ".join(all_ports) + "\n);",
+        ]
+        for p in pi_ports:
+            lines.append(f"  input {p};")
+        lines.append("  output _miter_diff_out;")
+
+        # Declare internal wires
+        internal_wires = set()
+        for node in needed_nodes.values():
+            w = clean_sig(node.output)
+            if w not in pi_ports and w != "_miter_diff_out":
+                internal_wires.add(w)
+        for w in sorted(internal_wires):
+            lines.append(f"  wire {w};")
+
+        # Emit gate instances in combinational DAG
+        for idx, node in enumerate(needed_nodes.values()):
+            gt = node.gate_type.lower()
+            out_str = clean_sig(node.output)
+            in_strs = [clean_sig(i) for i in node.inputs]
+            lines.append(f"  {gt} _cg_{idx} ({out_str}, {', '.join(in_strs)});")
+
+        # Emit XOR miter gate
+        lines.append(f"  xor _miter_xor (_miter_diff_out, {clean_t1}, {clean_t2});")
+        lines.append("endmodule\n")
+
+        return "\n".join(lines), len(needed_nodes)
+
+    def _prove_miter_satisfiability(
+        self,
+        miter_verilog: str,
+        top_module: str = "_signal_equiv_miter",
+        diff_sig: str = "_miter_diff_out",
+        timeout_sec: int = 60,
+    ) -> Tuple[bool, int, str]:
+        """Run single-pass Yosys SAT on XOR miter diff_sig == 1.
+
+        Returns:
+            (is_equivalent: bool, yosys_calls: int, error_msg: str)
+        """
+        tmp_dir = _workspace_temp_dir()
+        tf_verilog = tempfile.NamedTemporaryFile("w", suffix=".v", dir=tmp_dir, delete=False)
+        tf_verilog.write(miter_verilog)
+        tf_verilog.close()
+
+        tf_script = tempfile.NamedTemporaryFile("w", suffix=".ys", dir=tmp_dir, delete=False)
+        tf_script.write(f"""
+read_verilog {tf_verilog.name}
+prep -top {top_module}
+sat -set {diff_sig} 1
+""")
+        tf_script.close()
+
+        try:
+            result = subprocess.run(
+                [_yosys_binary(), "-s", tf_script.name],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                env=_temp_subprocess_env(),
+                cwd=tmp_dir,
+            )
+            combined = (result.stdout or "") + "\n" + (result.stderr or "")
+            lower = combined.lower()
+
+            if "sat solving finished - no model found" in lower:
+                return True, 1, ""
+            if "sat solving finished - model found" in lower:
+                return False, 1, ""
+
+            err_summary = combined[-1000:] if combined else "Unknown Yosys error"
+            return False, 1, f"Yosys SAT inconclusive: {err_summary}"
+
+        except subprocess.TimeoutExpired:
+            return False, 1, f"Yosys SAT timed out after {timeout_sec}s"
+        except Exception as exc:
+            return False, 1, f"Yosys execution failed: {exc}"
+        finally:
+            for p in (tf_verilog.name, tf_script.name):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     def _yosys_check_signals_equiv(
         self, netlist_verilog: str, top: str, sig1: str, sig2: str
