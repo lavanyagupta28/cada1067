@@ -20,6 +20,10 @@ except ImportError:
 
 from .eda_engine import EDAEngine
 from .tools import TOOLS
+from .code_generator import DynamicToolGenerator
+from .dynamic_tools.registry import save_dynamic_tool
+import importlib
+import types
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,25 @@ class EDAAgent:
         )
         self._last_llm_call_started: float = 0.0
         self._active_user_message: str = ""
+
+        # Dynamic tool generation & persistent catalog
+        self._generator = DynamicToolGenerator(self)
+        self._all_tools: List[Dict[str, Any]] = list(TOOLS)
+
+        dynamic_dir = Path(__file__).resolve().parent / "dynamic_tools"
+        if dynamic_dir.exists():
+            for tool_file in sorted(dynamic_dir.glob("tool_*.py")):
+                mod_name = f"src.dynamic_tools.{tool_file.stem}"
+                try:
+                    mod = importlib.import_module(mod_name)
+                    if hasattr(mod, "SCHEMA"):
+                        self._all_tools.append(mod.SCHEMA)
+                        dyn_tool_name = mod.SCHEMA["function"]["name"]
+                        if hasattr(mod, dyn_tool_name):
+                            dyn_func = getattr(mod, dyn_tool_name)
+                            setattr(self._engine, dyn_tool_name, types.MethodType(dyn_func, self._engine))
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Client construction
@@ -1095,6 +1118,10 @@ class EDAAgent:
                 f"cone {sig} depth {before} → {after} "
                 f"(improved by {imp}); restricted to {gates} {status}"
             )
+        elif tool_name == "declare_missing_tool":
+            status = data.get("status", "OK")
+            tool_name_created = data.get("new_tool_name", "")
+            return f"declare_missing_tool: {status} (created {tool_name_created})"
         else:
             return f"{tool_name} completed"
 
@@ -1355,7 +1382,7 @@ class EDAAgent:
                     return self._client.chat.completions.create(
                         model=self._model,
                         messages=messages,
-                        tools=TOOLS,
+                        tools=self._all_tools,
                         tool_choice="auto",
                         temperature=self._temperature,
                         max_tokens=self._max_tokens,
@@ -1389,6 +1416,32 @@ class EDAAgent:
                 time.sleep(delay)
 
         raise RuntimeError("OpenAI API retry loop ended unexpectedly.")
+
+    def _call_llm_json(self, prompt: str) -> Dict[str, Any]:
+        """Query LLM for structured JSON response during dynamic code generation."""
+        self._pace_llm_call()
+        try:
+            with _Timeout(_SLOW_TIMEOUT):
+                resp = self._client.chat.completions.create(
+                    model=self._model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an expert EDA core Python developer for the cada1067 framework. "
+                                "You must respond ONLY with a valid JSON object matching the requested schema."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                    max_tokens=self._max_tokens,
+                )
+            content = resp.choices[0].message.content or "{}"
+            return json.loads(content)
+        except Exception as exc:
+            raise RuntimeError(f"Error querying model for JSON: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Internal: tool dispatch
@@ -1440,6 +1493,35 @@ class EDAAgent:
             ValueError: If the tool name is unknown.
         """
         eng = self._engine
+
+        if tool_name == "declare_missing_tool":
+            success, code, schema, msg = self._generator.generate_and_verify(args)
+            if not success or not code or not schema:
+                return {"error": f"Dynamic tool synthesis failed: {msg}"}
+
+            new_tool_name = args["tool_name"]
+
+            # 1. Hot-patch active engine in RAM
+            namespace: Dict[str, Any] = {}
+            exec(compile(code, f"<dynamic_{new_tool_name}>", "exec"), namespace)
+            func = namespace[new_tool_name]
+            setattr(self._engine, new_tool_name, types.MethodType(func, self._engine))
+
+            # 2. Add schema to active tool list so LLM knows about it
+            self._all_tools.append(schema)
+
+            # 3. Persist to disk for tomorrow
+            save_dynamic_tool(new_tool_name, code, schema)
+
+            return {
+                "status": "SUCCESS",
+                "message": msg,
+                "new_tool_name": new_tool_name,
+                "instruction": (
+                    f"Tool '{new_tool_name}' has been created, verified, and loaded into your tool library. "
+                    f"Now immediately call '{new_tool_name}' to satisfy the user request."
+                ),
+            }
 
         if tool_name == "read_design":
             eng.load(args["filepath"])
@@ -1943,5 +2025,10 @@ class EDAAgent:
 
         if tool_name == "check_design_equivalence":
             return eng.check_design_equivalence()
+
+        # Dynamic tools attached to engine
+        if hasattr(eng, tool_name):
+            method = getattr(eng, tool_name)
+            return method(**args)
 
         raise ValueError(f"Unknown tool: {tool_name!r}")

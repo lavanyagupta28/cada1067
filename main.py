@@ -40,13 +40,21 @@ def main() -> None:
     )
     parser.add_argument(
         "-config",
+        "--config",
         metavar="<config_file_path>",
+        dest="config",
         default=os.path.join(_SCRIPT_DIR, "config.yaml"),
         help="Configuration file path (defaults to config.yaml beside this entrypoint).",
     )
     args = parser.parse_args()
 
     config = _load_config(args.config)
+
+    try:
+        from scripts.test_utils import setup_eda_environment
+        setup_eda_environment(config)
+    except Exception:
+        pass
 
     from src.agent import EDAAgent
     from src.eda_engine import EDAEngine

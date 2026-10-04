@@ -1769,4 +1769,50 @@ TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "declare_missing_tool",
+            "description": (
+                "Call this tool ONLY when you have thoroughly verified that NO existing tool "
+                "or combination of tools in your library can fulfill the user request. "
+                "You must provide an exhaustive functional specification so our code generator "
+                "can write the Python implementation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "Canonical snake_case name for the new tool (e.g. 'count_odd_input_gates').",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "An exhaustive, precise functional specification of the required tool. "
+                            "You MUST include: "
+                            "1. The exact mathematical calculation, topological query, or mutation rule. "
+                            "2. How input parameters (e.g. signal names, threshold numbers) should be used. "
+                            "3. What keys and values must be returned in the output dictionary. "
+                            "4. Any special conditions (e.g., what to return if 0 matches are found)."
+                        ),
+                    },
+                    "is_transformation": {
+                        "type": "boolean",
+                        "description": "True if the tool modifies the netlist; False if it is a read-only query.",
+                    },
+                    "preserves_equivalence": {
+                        "type": "boolean",
+                        "description": "True if transformation must preserve combinational logic equivalence. Default True.",
+                    },
+                    "parameters_needed": {
+                        "type": "object",
+                        "description": "Key-value dictionary of parameter names, their types, and descriptions.",
+                    },
+                },
+                "required": ["tool_name", "description", "is_transformation", "parameters_needed"],
+            },
+        },
+    },
 ]
+

@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
@@ -52,6 +53,17 @@ def _temp_subprocess_env() -> Dict[str, str]:
     return env
 
 
+_WINDOWS_FALLBACK_YOSYS = [
+    r"C:\Users\lavan\Desktop\Downloads\oss-cad-suite-windows-x64-20260827\oss-cad-suite\bin\yosys.exe",
+    r"C:\oss-cad-suite\bin\yosys.exe",
+]
+
+_WINDOWS_FALLBACK_ABC = [
+    r"C:\Users\lavan\Desktop\Downloads\oss-cad-suite-windows-x64-20260827\oss-cad-suite\bin\yosys-abc.exe",
+    r"C:\oss-cad-suite\bin\yosys-abc.exe",
+]
+
+
 def _yosys_binary() -> str:
     """Resolve Yosys from YOSYS_BIN or PATH and validate executability."""
     configured = os.environ.get("YOSYS_BIN", "").strip()
@@ -66,6 +78,12 @@ def _yosys_binary() -> str:
     resolved = shutil.which("yosys")
     if resolved:
         return resolved
+
+    if sys.platform == "win32":
+        for cand in _WINDOWS_FALLBACK_YOSYS:
+            if os.path.isfile(cand):
+                return cand
+
     raise RuntimeError(
         "Yosys executable not found. Set YOSYS_BIN or add yosys to PATH."
     )
@@ -85,6 +103,12 @@ def _abc_binary() -> str:
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
+
+    if sys.platform == "win32":
+        for cand in _WINDOWS_FALLBACK_ABC:
+            if os.path.isfile(cand):
+                return cand
+
     raise RuntimeError(
         "ABC executable not found. Set ABC_BIN or add yosys-abc/abc to PATH."
     )
@@ -243,6 +267,35 @@ class EDAEngine:
     def _require_netlist(self) -> None:
         if self._netlist is None:
             raise ValueError("No netlist loaded. Call read_design first.")
+
+    def validate_netlist_integrity(self, nl: Optional[Netlist] = None) -> List[str]:
+        """Audit netlist graph integrity. Returns a list of error strings (empty if valid)."""
+        target_nl = nl if nl is not None else self._netlist
+        if target_nl is None:
+            return ["Netlist is None"]
+
+        errors: List[str] = []
+        valid_wires = set(target_nl.wires) | set(target_nl.primary_inputs) | {"1'b0", "1'b1", "1", "0", "'0", "'1"}
+
+        # 1. Check for dangling gate input pins
+        for inst_name, node in target_nl.nodes.items():
+            for pin_idx, inp_sig in enumerate(node.inputs):
+                base_sig = inp_sig.split("[")[0] if "[" in inp_sig else inp_sig
+                if inp_sig not in valid_wires and base_sig not in valid_wires:
+                    errors.append(f"Gate {inst_name} input pin {pin_idx} ({inp_sig}) is not in wires or primary inputs.")
+
+        # 2. Check for single-driver invariant on combinational nets
+        driver_counts: Dict[str, int] = {}
+        for node in target_nl.nodes.values():
+            driver_counts[node.output] = driver_counts.get(node.output, 0) + 1
+        for pi in target_nl.primary_inputs:
+            driver_counts[pi] = driver_counts.get(pi, 0) + 1
+
+        for wire, count in driver_counts.items():
+            if count > 1:
+                errors.append(f"Multi-driver collision detected on net {wire!r} ({count} drivers).")
+
+        return errors
 
     # ------------------------------------------------------------------
     # Internal graph helpers
