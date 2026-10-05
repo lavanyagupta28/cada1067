@@ -1774,10 +1774,12 @@ TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "declare_missing_tool",
             "description": (
-                "Call this tool ONLY when you have thoroughly verified that NO existing tool "
-                "or combination of tools in your library can fulfill the user request. "
-                "You must provide an exhaustive functional specification so our code generator "
-                "can write the Python implementation."
+                "Synthesize and create a new custom tool dynamically. Call this tool whenever "
+                "the user's request asks for a query, property, analysis, or transformation that "
+                "is not directly supported by an exact existing tool (for example: finding nets that "
+                "drive multiple gate types, checking gate input pin counts/parity, custom topological "
+                "queries, or novel logic transformations). Provide an exhaustive specification so the "
+                "engine can generate, test, and register the new tool."
             ),
             "parameters": {
                 "type": "object",

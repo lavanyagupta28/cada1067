@@ -60,6 +60,11 @@ _SYSTEM_PROMPT = (
     "a gate-level Verilog netlist, call the appropriate tool(s) in the correct order. "
     "After all tool calls are complete, return a concise, clear natural-language answer "
     "describing what was found or what was changed. Do not discuss scoring or evaluation. "
+    "When a user request requires an analysis, topological query, predicate check, or "
+    "transformation that is not directly supported by an exact existing tool (for example: "
+    "custom gate/net properties, combinations of gate types, or operations whose required inputs "
+    "do not match any tool's parameters), you MUST call declare_missing_tool to synthesize the "
+    "required tool. Never make speculative tool calls with invented signal names or fabricate arguments. "
     "User prompts arrive sequentially. If the current request asks for a result or fact "
     "already recorded in the ordered context history, answer directly from that history "
     "without calling another tool. Call tools only when the needed fact is absent from "
@@ -89,7 +94,10 @@ _SYSTEM_PROMPT = (
     "where only one named cone must use a restricted gate set and the cost is whole-design "
     "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
     "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
-    "reduce_critical_path with allowed_gates is only for restricting the whole design."
+    "reduce_critical_path with allowed_gates is only for restricting the whole design. "
+    "If the user's request asks for a property, structural query, or transformation for which "
+    "NO available tool (or combination of tools) in your tool set is capable, you MUST call "
+    "declare_missing_tool to synthesize the required tool. Do not guess, estimate, or refuse."
 )
 
 # Timeouts (seconds) per category
