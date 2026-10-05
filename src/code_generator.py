@@ -82,8 +82,8 @@ CIRCUIT DATA STRUCTURE (self._netlist)
 ================================================================================
 - `self._netlist.nodes`: dict of gate_name -> GateNode
     Each GateNode has:
-      - .name (str)
       - .gate_type (str, lower-case: 'and', 'nand', 'or', 'nor', 'xor', 'xnor', 'not', 'buf')
+      - Note: Always compare gate types in a case-insensitive manner (e.g. `gate.gate_type.lower() == t.lower()` or normalize input lists `[t.lower() for t in gate_types]`).
       - .inputs (list[str]: driving wire names)
       - .output (str: driven wire name)
 - `self._netlist.dffs`: dict of dff_name -> DFFNode (.name, .ck, .rn, .sn, .d, .q, .qn)

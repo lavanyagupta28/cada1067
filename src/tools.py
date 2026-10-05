@@ -1116,10 +1116,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "the matching instances, their inputs, matched input indices, and other_inputs. "
                 "If the result contains file_path, the complete list has been written there and "
                 "the final answer must report that exact path. "
-                "CRITICAL: This tool ONLY filters by gate_type and input_count. If the user prompt "
-                "requires filtering by whether the gate's output drives a primary output pin, another "
-                "specific gate type, or any downstream sink topology, do NOT call find_gates; "
-                "you MUST call declare_missing_tool instead."
+                "Do not call find_gates if the user request specifies additional constraints (such as "
+                "custom topological connections, downstream sink requirements, or relational properties) "
+                "that cannot be expressed in this tool's parameters; use declare_missing_tool instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1776,11 +1775,12 @@ TOOLS: List[Dict[str, Any]] = [
             "name": "declare_missing_tool",
             "description": (
                 "Synthesize and create a new custom tool dynamically. Call this tool whenever "
-                "the user's request asks for a query, property, analysis, or transformation that "
-                "is not directly supported by an exact existing tool (for example: finding gates whose "
-                "output drives a primary output pin, finding nets that drive multiple gate types, "
-                "checking gate input pin counts/parity, custom topological queries, or novel logic transformations). "
-                "Provide an exhaustive specification so the engine can generate, test, and register the new tool."
+                "the user's request requires computing a predicate, structural condition, or transformation "
+                "that cannot be fully expressed by the arguments of a single existing tool. "
+                "Examples include: arithmetic/parity predicates on netlist attributes (e.g. odd/even inputs, "
+                "fanout thresholds), multi-hop topological filters, or custom logic remapping. "
+                "CRITICAL: Do NOT attempt to simulate these predicates by looping through individual "
+                "candidate values with existing tools; invoke declare_missing_tool directly."
             ),
             "parameters": {
                 "type": "object",

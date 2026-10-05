@@ -95,12 +95,12 @@ _SYSTEM_PROMPT = (
     "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
     "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
     "reduce_critical_path with allowed_gates is only for restricting the whole design. "
-    "If the user's request asks for a property, structural query, or transformation that cannot "
-    "be fully solved by existing tool arguments (for example: gates whose output drives a primary output pin, "
-    "gates driving specific gate types, gates with odd/even input counts, nets driving multiple "
-    "gate types, or novel logic transformations), you MUST call declare_missing_tool directly to "
-    "synthesize the required tool. Do NOT call find_gates or other generic tools if they cannot "
-    "evaluate the full condition, and NEVER invent speculative signal names (such as 'PO')."
+    "The Rule of Complete Matching: Before calling any tool, verify that the tool's parameters "
+    "can directly and fully satisfy ALL constraints of the user's request. If a request combines "
+    "multiple structural criteria, custom topological relations, or property checks where existing "
+    "tools only satisfy a partial subset and cannot pipe into another tool, DO NOT make a partial "
+    "tool call or guess arguments. You MUST call declare_missing_tool directly to synthesize the "
+    "exact atomic tool required."
 )
 
 # Timeouts (seconds) per category
@@ -1297,6 +1297,19 @@ class EDAAgent:
                         compact_result_str = self._compact_tool_result_for_llm(
                             tool_name, result_str
                         )
+                        if '"error"' in compact_result_str or "'error'" in compact_result_str:
+                            try:
+                                err_obj = json.loads(compact_result_str)
+                                if isinstance(err_obj, dict) and "error" in err_obj and tool_name != "declare_missing_tool":
+                                    err_obj["hint"] = (
+                                        "If the query requires topological checks, composite filters, or structural relations "
+                                        "not directly supported by existing tool parameters, do not guess argument values. "
+                                        "Call declare_missing_tool to synthesize the exact tool needed."
+                                    )
+                                    compact_result_str = json.dumps(err_obj)
+                            except Exception:
+                                pass
+
                         messages.append(
                             {
                                 "role": "tool",
