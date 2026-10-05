@@ -83,7 +83,9 @@ CIRCUIT DATA STRUCTURE (self._netlist)
 - `self._netlist.nodes`: dict of gate_name -> GateNode
     Each GateNode has:
       - .gate_type (str, lower-case: 'and', 'nand', 'or', 'nor', 'xor', 'xnor', 'not', 'buf')
+      - Note: Gates include inverters ('not') and buffers ('buf') as well as standard logic gates.
       - Note: Always compare gate types in a case-insensitive manner (e.g. `gate.gate_type.lower() == t.lower()` or normalize input lists `[t.lower() for t in gate_types]`).
+      - Note: Parameters should have safe defaults (e.g. `gate_types: Optional[List[str]] = None`). If `gate_types` is None or omitted, the tool must process ALL gates in the design.
       - .inputs (list[str]: driving wire names)
       - .output (str: driven wire name)
 - `self._netlist.dffs`: dict of dff_name -> DFFNode (.name, .ck, .rn, .sn, .d, .q, .qn)

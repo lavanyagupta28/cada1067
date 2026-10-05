@@ -1810,7 +1810,11 @@ TOOLS: List[Dict[str, Any]] = [
                     },
                     "parameters_needed": {
                         "type": "object",
-                        "description": "Key-value dictionary of parameter names, their types, and descriptions.",
+                        "description": (
+                            "Key-value dictionary of parameter names and types. Only declare parameters "
+                            "that are genuinely required by the user prompt. For global whole-design queries "
+                            "with no specific user-specified inputs or filters, leave this as an empty dictionary {}."
+                        ),
                     },
                 },
                 "required": ["tool_name", "description", "is_transformation", "parameters_needed"],
