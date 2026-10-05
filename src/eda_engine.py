@@ -326,17 +326,18 @@ class EDAEngine:
         """Validate that *name* is a known signal; return it unchanged."""
         nl = self._netlist
         assert nl is not None
-        known = (
-            set(nl.primary_inputs)
-            | set(nl.primary_outputs)
-            | set(nl.wires.keys())
-            | {n.output for n in nl.nodes.values()}
-            | {inp for n in nl.nodes.values() for inp in n.inputs}
-            | {dff.q for dff in nl.dffs.values()}
-            | {dff.d for dff in nl.dffs.values()}
-            | {"1'b0", "1'b1"}
-        )
-        if name not in known:
+        if not hasattr(nl, "_cached_known_signals") or getattr(nl, "_cached_known_signals", None) is None:
+            nl._cached_known_signals = (
+                set(nl.primary_inputs)
+                | set(nl.primary_outputs)
+                | set(nl.wires.keys())
+                | {n.output for n in nl.nodes.values()}
+                | {inp for n in nl.nodes.values() for inp in n.inputs}
+                | {dff.q for dff in nl.dffs.values()}
+                | {dff.d for dff in nl.dffs.values()}
+                | {"1'b0", "1'b1"}
+            )
+        if name not in nl._cached_known_signals:
             raise ValueError(f"Signal {name!r} not found in netlist.")
         return name
 
