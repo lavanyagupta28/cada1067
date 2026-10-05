@@ -95,9 +95,12 @@ _SYSTEM_PROMPT = (
     "maximum depth, use optimize_depth_preserving_cone_gate_set; when the cost is the "
     "depth of that cone itself, use optimize_cone_depth_preserving_gate_set; "
     "reduce_critical_path with allowed_gates is only for restricting the whole design. "
-    "If the user's request asks for a property, structural query, or transformation for which "
-    "NO available tool (or combination of tools) in your tool set is capable, you MUST call "
-    "declare_missing_tool to synthesize the required tool. Do not guess, estimate, or refuse."
+    "If the user's request asks for a property, structural query, or transformation that cannot "
+    "be fully solved by existing tool arguments (for example: gates whose output drives a primary output pin, "
+    "gates driving specific gate types, gates with odd/even input counts, nets driving multiple "
+    "gate types, or novel logic transformations), you MUST call declare_missing_tool directly to "
+    "synthesize the required tool. Do NOT call find_gates or other generic tools if they cannot "
+    "evaluate the full condition, and NEVER invent speculative signal names (such as 'PO')."
 )
 
 # Timeouts (seconds) per category

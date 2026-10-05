@@ -1116,9 +1116,10 @@ TOOLS: List[Dict[str, Any]] = [
                 "the matching instances, their inputs, matched input indices, and other_inputs. "
                 "If the result contains file_path, the complete list has been written there and "
                 "the final answer must report that exact path. "
-                "For later prompts that say 'reported gates' or 'reported NAND gates', use the "
-                "most recent relevant find_gates result from context; if it reported zero matches, "
-                "do not transform anything."
+                "CRITICAL: This tool ONLY filters by gate_type and input_count. If the user prompt "
+                "requires filtering by whether the gate's output drives a primary output pin, another "
+                "specific gate type, or any downstream sink topology, do NOT call find_gates; "
+                "you MUST call declare_missing_tool instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1776,10 +1777,10 @@ TOOLS: List[Dict[str, Any]] = [
             "description": (
                 "Synthesize and create a new custom tool dynamically. Call this tool whenever "
                 "the user's request asks for a query, property, analysis, or transformation that "
-                "is not directly supported by an exact existing tool (for example: finding nets that "
-                "drive multiple gate types, checking gate input pin counts/parity, custom topological "
-                "queries, or novel logic transformations). Provide an exhaustive specification so the "
-                "engine can generate, test, and register the new tool."
+                "is not directly supported by an exact existing tool (for example: finding gates whose "
+                "output drives a primary output pin, finding nets that drive multiple gate types, "
+                "checking gate input pin counts/parity, custom topological queries, or novel logic transformations). "
+                "Provide an exhaustive specification so the engine can generate, test, and register the new tool."
             ),
             "parameters": {
                 "type": "object",
