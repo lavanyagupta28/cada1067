@@ -1417,12 +1417,18 @@ class EDAAgent:
         return None
 
     @staticmethod
-    def _is_rate_limit_error(exc: Exception) -> bool:
-        """Return whether an SDK exception represents HTTP 429."""
-        return (
-            getattr(exc, "status_code", None) == 429
-            or exc.__class__.__name__ == "RateLimitError"
-        )
+    def _is_retryable_error(exc: Exception) -> bool:
+        """Return whether an SDK exception represents a transient/retryable condition."""
+        status = getattr(exc, "status_code", None)
+        if status in (429, 500, 502, 503, 504):
+            return True
+        name = exc.__class__.__name__
+        if name in ("RateLimitError", "APITimeoutError", "APIConnectionError", "InternalServerError"):
+            return True
+        msg = str(exc).lower()
+        if any(keyword in msg for keyword in ("timed out", "timeout", "connection error", "connection reset", "broken pipe")):
+            return True
+        return False
 
     def _pace_llm_call(self) -> None:
         """Enforce a minimum interval between all model-call attempts."""
@@ -1466,11 +1472,11 @@ class EDAAgent:
             except Exception as exc:
                 if "credit_balance_exhausted" in str(exc) or "insufficient_quota" in str(exc):
                     raise RuntimeError(f"OpenAI API quota exhausted: {exc}") from exc
-                if not self._is_rate_limit_error(exc):
+                if not self._is_retryable_error(exc):
                     raise RuntimeError(f"OpenAI API error: {exc}") from exc
                 if attempt >= self._rate_limit_max_retries:
                     raise RuntimeError(
-                        "OpenAI API rate limit remained active after "
+                        "OpenAI API transient error remained active after "
                         f"{self._rate_limit_max_retries} retries: {exc}"
                     ) from exc
 
