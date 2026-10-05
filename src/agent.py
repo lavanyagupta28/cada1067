@@ -99,7 +99,10 @@ _SYSTEM_PROMPT = (
     "can directly and fully satisfy ALL constraints of the user's request. If a request combines "
     "multiple structural criteria, custom topological relations, or property checks where existing "
     "tools only satisfy a partial subset and cannot pipe into another tool, DO NOT make a partial "
-    "tool call or guess arguments. You MUST call declare_missing_tool directly to synthesize the "
+    "tool call or guess arguments. Specifically, if a prompt asks for primary inputs or primary outputs "
+    "matching gate conditions, do NOT call generic wire tools and then attempt to manually loop through "
+    "individual nets with get_net_connections or get_net_fanout. LLMs cannot iterate through large netlists "
+    "via repetitive tool calls. You MUST call declare_missing_tool directly to synthesize the "
     "exact atomic tool required."
 )
 
@@ -153,7 +156,7 @@ class EDAAgent:
         self._max_tokens: int = int(gen.get("max_output_tokens", 4096))
 
         safety = config.get("safety", {})
-        self._max_tool_rounds: int = int(safety.get("max_tool_rounds", 4))
+        self._max_tool_rounds: int = int(safety.get("max_tool_rounds", 8))
         self._max_inline_items: int = int(safety.get("max_inline_items", 10))
         self._max_tool_result_chars: int = int(
             safety.get("max_tool_result_chars", 2000)
@@ -1241,13 +1244,55 @@ class EDAAgent:
                             tool_name, tc.function.arguments
                         )
                         if call_signature in seen_tool_calls:
-                            final_text = (
-                                "Stopped after the model repeated the same tool call "
-                                f"({tool_name}) with the same arguments in one request. "
-                                "This guard prevents repeated token spend when a tool "
-                                "result is not resolving the request."
+                            duplicate_count = getattr(self, "_duplicate_call_count", 0) + 1
+                            self._duplicate_call_count = duplicate_count
+                            if duplicate_count > 3:
+                                final_text = (
+                                    "Stopped after the model repeated the same tool call "
+                                    f"({tool_name}) with the same arguments in one request. "
+                                    "This guard prevents repeated token spend when a tool "
+                                    "result is not resolving the request."
+                                )
+                                return finish(final_text)
+                            result_str = json.dumps(
+                                {
+                                    "error": (
+                                        f"Duplicate tool call '{tool_name}' detected. Do not repeatedly call "
+                                        "individual tools to iterate over nets or gates. Call declare_missing_tool "
+                                        "to synthesize a single atomic tool that evaluates the full condition."
+                                    )
+                                }
                             )
-                            return finish(final_text)
+                            conv_log.log_tool_result(tool_name, result_str)
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": result_str,
+                                }
+                            )
+                        # Detect manual single-item iteration loops across items in a request
+                        if tool_name in {"get_net_fanout", "get_net_connections", "get_gate_output_fanout"}:
+                            prior_calls = [s for s in seen_tool_calls if s.startswith(f"{tool_name}:")]
+                            if len(prior_calls) >= 1:
+                                result_str = json.dumps(
+                                    {
+                                        "error": (
+                                            f"Manual iteration detected: '{tool_name}' was already called for another net in this request. "
+                                            "Do not attempt to inspect items one by one in a loop; this exceeds the round limit. "
+                                            "Call declare_missing_tool to synthesize a dedicated tool that evaluates the full condition across the design."
+                                        )
+                                    }
+                                )
+                                conv_log.log_tool_result(tool_name, result_str)
+                                messages.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": result_str,
+                                    }
+                                )
+                                continue
                         seen_tool_calls.add(call_signature)
 
                         if skip_reduce_for_cone_depth and tool_name == "reduce_critical_path":
@@ -1283,6 +1328,9 @@ class EDAAgent:
                             tool_name, tc.function.arguments, op_timeout
                         )
                         conv_log.log_tool_result(tool_name, result_str)
+                        if tool_name == "declare_missing_tool":
+                            # Synthesizing a tool is a meta-operation; grant extra rounds to execute it and answer
+                            tool_rounds = max(0, tool_rounds - 2)
 
                         # Track operation in context history
                         summary = self._summarize_tool_result(
